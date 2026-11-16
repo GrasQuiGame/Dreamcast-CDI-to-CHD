@@ -1,4 +1,0 @@
-2026-11-16 10:00:00  Start: 1 CDI file(s) found
-2026-11-16 10:01:00  CONVERTING: Example
-2026-11-16 10:02:00  OK: Example
-2026-11-16 10:02:00  Finished: 1 succeeded, 0 skipped, 0 failed
