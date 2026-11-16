@@ -1,4 +1,4 @@
-**Current version: v1.0.0**
+**Current version: v1.0.1**
 
 # Dreamcast-CDI-to-CHD
 
@@ -42,3 +42,6 @@ Use this tool only with images you are legally allowed to possess and convert. T
 ## Support
 
 GitHub Sponsors: https://github.com/sponsors/GrasQuiGame
+
+
+For advanced diagnostics, `-StrictHeader` makes the conversion fail when no ISO data track starts with the Dreamcast boot header `SEGA SEGAKATANA`.

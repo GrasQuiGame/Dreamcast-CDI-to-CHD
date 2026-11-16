@@ -3,6 +3,14 @@
   Standalone mode: place this folder inside the folder containing CDI files,
   then double-click Start-Dreamcast-CDI-to-CHD.cmd.
   Original CDI files are never modified or deleted.
+
+  v1.0.1
+    - Extracted tracks are now ordered by track number (numeric sort), so a
+      disc with 10+ tracks can no longer map track 10 before track 2.
+    - Tracks are renamed in two phases, so a file can never overwrite another.
+    - Dreamcast header check ("SEGA SEGAKATANA") on the extracted data track.
+      It logs a warning by default; -StrictHeader turns it into a failure.
+    - All log messages are now in English.
 #>
 
 [CmdletBinding()]
@@ -18,7 +26,10 @@ param(
 
   [int]$Limit = 0,
 
-  [switch]$DeleteTempOnError
+  [switch]$DeleteTempOnError,
+
+  # Fail the conversion if no data track starts with the Dreamcast header.
+  [switch]$StrictHeader
 )
 
 $ErrorActionPreference = 'Stop'
@@ -87,6 +98,38 @@ function Test-ReadableFile([string]$Path) {
       [IO.FileShare]::Read
     )
     return $true
+  }
+  catch {
+    return $false
+  }
+  finally {
+    if ($null -ne $stream) {
+      $stream.Dispose()
+    }
+  }
+}
+
+# Builds a sort key from every number found in a file name, each padded to
+# 8 digits, so that "track2" sorts before "track10" (plain name sort does not).
+function Get-NumericSortKey([string]$Name) {
+  $parts = @([regex]::Matches($Name, '\d+') | ForEach-Object { $_.Value.PadLeft(8, '0') })
+  return ($parts -join '-')
+}
+
+# A Dreamcast data track (ISO, 2048 bytes/sector) starts with "SEGA SEGAKATANA ".
+function Test-DreamcastHeader([string]$Path) {
+  $stream = $null
+  try {
+    $stream = [IO.File]::Open(
+      $Path,
+      [IO.FileMode]::Open,
+      [IO.FileAccess]::Read,
+      [IO.FileShare]::Read
+    )
+    $buffer = New-Object byte[] 16
+    $read = $stream.Read($buffer, 0, 16)
+    if ($read -lt 16) { return $false }
+    return ([Text.Encoding]::ASCII.GetString($buffer) -eq 'SEGA SEGAKATANA ')
   }
   catch {
     return $false
@@ -175,21 +218,29 @@ foreach ($f in $files) {
       Fail 'No tracks detected in cdirip.exe output'
     }
 
+    # Sorted by the numbers in the file name (numeric, not alphabetical),
+    # so track 10 can never come before track 2.
     $extractedFiles = @(
       Get-ChildItem -LiteralPath $tmp -File |
         Where-Object { $_.Extension -in @('.bin', '.iso', '.wav', '.raw', '.cda', '.aiff') } |
-        Sort-Object Name
+        Sort-Object @{ Expression = { Get-NumericSortKey $_.BaseName } }, Name
     )
 
     if ($extractedFiles.Count -lt $tracks.Count) {
-      Fail "Not enough extracted files: $($extractedFiles.Count) fichier(s) pour $($tracks.Count) piste(s)"
+      Fail "Not enough extracted files: $($extractedFiles.Count) file(s) for $($tracks.Count) track(s)"
+    }
+    if ($extractedFiles.Count -gt $tracks.Count) {
+      Log "WARNING: $($extractedFiles.Count) extracted files for $($tracks.Count) tracks; only the first $($tracks.Count) are used"
     }
 
     Log "Tracks detected: $($tracks.Count)"
     Log "Extracted files: $($extractedFiles.Count)"
 
-    # Renommage dans l'ordre des pistes. CDIRip nomme normalement les fichiers
-    # avec le numero de piste ; le tri par nom conserve donc cet ordre.
+    # Phase 1: move every track to a temporary staging name.
+    # Phase 2: rename the staged files to their final trackNN name.
+    # Two phases guarantee that a rename never overwrites another extracted file.
+    $staged = [System.Collections.Generic.List[PSCustomObject]]::new()
+
     for ($i = 0; $i -lt $tracks.Count; $i++) {
       $track = $tracks[$i]
       $srcFile = $extractedFiles[$i]
@@ -203,16 +254,23 @@ foreach ($f in $files) {
         Fail "Extracted file cannot be read: $($srcFile.FullName)"
       }
 
-      Log ("TRACK {0} : {1}  {2:N0} octets  LBA {3}" -f `
+      Log ("TRACK {0}: {1}  {2:N0} bytes  LBA {3}" -f `
         $track.Num, $srcFile.Name, $size, $track.Lba)
 
       $ext = $srcFile.Extension.ToLowerInvariant()
-      $standardName = 'track{0:D2}{1}' -f $track.Num, $ext
-      $standardPath = Join-Path $tmp $standardName
+      $stagePath = Join-Path $tmp ('_stage{0:D2}{1}' -f $track.Num, $ext)
+      Move-Item -LiteralPath $srcFile.FullName -Destination $stagePath -Force
 
-      if ($srcFile.FullName -ne $standardPath) {
-        Move-Item -LiteralPath $srcFile.FullName -Destination $standardPath -Force
-      }
+      $staged.Add([PSCustomObject]@{
+        Num   = $track.Num
+        Stage = $stagePath
+        Ext   = $ext
+      })
+    }
+
+    foreach ($item in $staged) {
+      $standardPath = Join-Path $tmp ('track{0:D2}{1}' -f $item.Num, $item.Ext)
+      Move-Item -LiteralPath $item.Stage -Destination $standardPath -Force
     }
 
     # An audio/data or data/data CDI may contain only two tracks.
@@ -221,6 +279,7 @@ foreach ($f in $files) {
     # Flycast recognize this case as a MIL-CD and
     # rebuild the second session from the last data track.
     $cueLines = [System.Collections.Generic.List[string]]::new()
+    $headerTrack = 0
 
     for ($i = 0; $i -lt $tracks.Count; $i++) {
       $track = $tracks[$i]
@@ -235,9 +294,26 @@ foreach ($f in $files) {
       $cueFileType = if ($ext -eq '.wav' -or $track.Type -match 'Audio') { 'WAVE' } else { 'BINARY' }
       $cueTrackType = if ($cueFileType -eq 'WAVE') { 'AUDIO' } else { 'MODE1/2048' }
 
+      # Look for the Dreamcast boot header on the ISO data track(s).
+      if ($cueFileType -eq 'BINARY' -and $ext -eq '.iso' -and $headerTrack -eq 0) {
+        if (Test-DreamcastHeader $trackFile.FullName) {
+          $headerTrack = $track.Num
+        }
+      }
+
       $cueLines.Add(('FILE "{0}" {1}' -f $trackFile.Name, $cueFileType))
       $cueLines.Add(('  TRACK {0:D2} {1}' -f $track.Num, $cueTrackType))
       $cueLines.Add('    INDEX 01 00:00:00')
+    }
+
+    if ($headerTrack -gt 0) {
+      Log "Dreamcast header found on track $headerTrack"
+    }
+    elseif ($StrictHeader) {
+      Fail 'No data track starts with the Dreamcast header (SEGA SEGAKATANA)'
+    }
+    else {
+      Log 'WARNING: Dreamcast header not found on any ISO data track; test this game in Flycast'
     }
 
     $cuePath = Join-Path $tmp 'disc.cue'
@@ -292,7 +368,7 @@ foreach ($f in $files) {
 
     $before += $f.Length
     $after += $destSize
-    Log ("OK : {0}  {1:N0} Mo -> {2:N0} Mo" -f `
+    Log ("OK: {0}  {1:N0} MB -> {2:N0} MB" -f `
       $name, ($f.Length / 1MB), ($destSize / 1MB))
     $ok++
     $success = $true
@@ -326,7 +402,7 @@ foreach ($f in $files) {
 Log "Finished: $ok succeeded, $skip skipped, $fail failed"
 
 if ($before -gt 0) {
-  Log ("Space: {0:N2} Go -> {1:N2} Go (saved {2:N2} Go)" -f `
+  Log ("Space: {0:N2} GB -> {1:N2} GB (saved {2:N2} GB)" -f `
     ($before / 1GB), ($after / 1GB), (($before - $after) / 1GB))
 }
 

@@ -1,4 +1,4 @@
-This package is version **v1.0.0**.
+This package is version **v1.0.1**.
 
 # Installation
 

@@ -6,3 +6,5 @@
 - The log intentionally omits chdman percentage updates and normal tool banners. It keeps only conversion summaries and diagnostic lines when an error occurs.
 - Keep the original CDI files until the CHD has been tested in Flycast.
 - If a conversion fails, the incomplete CHD is deleted automatically.
+
+The header check is a warning by default. Use `-StrictHeader` only when you want missing `SEGA SEGAKATANA` to stop the conversion.
